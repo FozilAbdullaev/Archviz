@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Спальня — прогулка</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #ui { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column;
+        color: #eee; background: rgba(10, 10, 10, .72); text-align: center; gap: 14px; z-index: 2; }
+  #ui.hidden { display: none; }
+  #ui h1 { font-weight: 500; font-size: 26px; margin: 0; }
+  #ui p { margin: 0; color: #bbb; font-size: 15px; line-height: 1.5; }
+  #bar { width: 260px; height: 4px; background: #333; border-radius: 2px; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #d9b48f; transition: width .2s; }
+  #go { padding: 12px 28px; font-size: 16px; border: 0; border-radius: 6px; background: #d9b48f; color: #222;
+        cursor: pointer; display: none; }
+  #VRButton { z-index: 3; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>Спальня</h1>
+  <div id="bar"><i></i></div>
+  <p id="status">Загрузка…</p>
+  <button id="go">Войти</button>
+  <p>Мышь — осмотреться · WASD / стрелки — идти · Shift — быстрее · Esc — пауза<br>
+     В очках: кнопка «ENTER VR» внизу · левый стик — шаг · правый стик вперёд — телепорт, вбок — поворот</p>
+</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+  "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.8.3/build/index.module.js"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
+
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
+
+const CFG = await (await fetch('scene.json')).json();   // written by the export script
+const EYE = 1.6, RADIUS = 0.25;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.AgXToneMapping;
+renderer.toneMappingExposure = CFG.exposure;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.xr.enabled = true;
+renderer.xr.setFoveation(0.5);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100);
+const rig = new THREE.Group();               // moves the player (desktop camera + VR headset)
+rig.add(camera);
+scene.add(rig);
+
+const bar = document.querySelector('#bar i'), status = document.getElementById('status');
+const manager = new THREE.LoadingManager();
+manager.onProgress = (url, done, total) => { bar.style.width = (100 * done / total) + '%'; };
+
+// reflections: Cycles panorama from the middle of the room, used for specular only (light comes from lightmaps)
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envTex = await new RGBELoader(manager).loadAsync(CFG.env);
+envTex.mapping = THREE.EquirectangularReflectionMapping;
+const envMap = pmrem.fromEquirectangular(envTex).texture;
+envTex.dispose();
+if (CFG.sky) {                       // sky behind the windows (same HDRI and rotation as the bake)
+  const sky = await new RGBELoader(manager).loadAsync(CFG.sky);
+  sky.mapping = THREE.EquirectangularReflectionMapping;
+  scene.background = sky;
+  scene.backgroundRotation.set(0, THREE.MathUtils.degToRad(CFG.skyRotation || 0), 0);
+  scene.backgroundIntensity = CFG.skyIntensity ?? 1;
+}
+
+const tl = new THREE.TextureLoader(manager);
+const lightmaps = await Promise.all(CFG.lightmaps.map(async f => {
+  const t = await tl.loadAsync(f);
+  t.flipY = false; t.channel = 1; t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}));
+
+const draco = new DRACOLoader().setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/gltf/');
+const gltf = await new GLTFLoader(manager).setDRACOLoader(draco).loadAsync(CFG.model);
+const colliders = [];
+// lightmap texels carry an extra gamma 2.2 (more precision in the dark), the env map gives reflections only
+const LM_CHUNK = THREE.ShaderChunk.lights_fragment_maps
+  .replace('lightMapTexel.rgb * lightMapIntensity', 'pow( lightMapTexel.rgb, vec3( 2.2 ) ) * lightMapIntensity')
+  .replace('iblIrradiance += getIBLIrradiance( geometryNormal );', '');
+const specOnly = shader => {
+  shader.fragmentShader = shader.fragmentShader.replace('#include <lights_fragment_maps>', LM_CHUNK);
+};
+gltf.scene.traverse(o => {
+  if (!o.isMesh) return;
+  const lm = o.userData.lm ?? (o.parent && o.parent.userData.lm);
+  const mats = Array.isArray(o.material) ? o.material : [o.material];
+  for (const m of mats) {
+    m.envMap = envMap;
+    m.envMapIntensity = CFG.reflections;
+    if (lm !== undefined && lm >= 0 && o.geometry.attributes.uv1) {
+      m.lightMap = lightmaps[lm];
+      m.lightMapIntensity = CFG.lightmapScale * Math.PI;
+      m.onBeforeCompile = specOnly;
+      m.customProgramCacheKey = () => 'speconly';
+    } else if (!m.transparent) {
+      m.emissiveMap = m.emissiveMap || m.map;     // unbaked opaque object: keep it visible
+    }
+    if (m.map) m.map.anisotropy = 4;
+  }
+  o.matrixAutoUpdate = false; o.updateMatrix();
+  if (lm !== undefined && lm >= 0) { o.geometry.computeBoundsTree(); colliders.push(o); }
+});
+scene.add(gltf.scene);
+scene.updateMatrixWorld(true);
+window.__dbg = { THREE, scene, camera, rig, renderer };
+
+// start position (glTF is Y-up: three x = blender x, three z = -blender y)
+rig.position.set(CFG.spawn[0], 0, -CFG.spawn[1]);
+rig.rotation.y = THREE.MathUtils.degToRad(CFG.spawnYaw || 0);
+camera.position.set(0, EYE, 0);
+
+// ---------- movement & collision ----------
+const ray = new THREE.Raycaster(); ray.firstHitOnly = true;
+function blocked(from, dir, dist) {
+  for (const h of [0.45, 1.1]) {
+    ray.set(new THREE.Vector3(from.x, h, from.z), dir); ray.far = dist + RADIUS;
+    if (ray.intersectObjects(colliders, false).length) return true;
+  }
+  return false;
+}
+function tryMove(delta) {                    // slide along walls: x and z separately
+  const p = new THREE.Vector3(); camera.getWorldPosition(p);
+  for (const axis of ['x', 'z']) {
+    const d = new THREE.Vector3(); d[axis] = delta[axis];
+    const len = Math.abs(d[axis]); if (len < 1e-6) continue;
+    if (!blocked(p, d.clone().normalize(), len)) { rig.position[axis] += d[axis]; p[axis] += d[axis]; }
+  }
+}
+
+// desktop
+const controls = new PointerLockControls(camera, document.body);
+const ui = document.getElementById('ui'), go = document.getElementById('go');
+go.onclick = () => controls.lock();
+controls.addEventListener('lock', () => ui.classList.add('hidden'));
+controls.addEventListener('unlock', () => { if (!renderer.xr.isPresenting) ui.classList.remove('hidden'); });
+const keys = {};
+addEventListener('keydown', e => { keys[e.code] = true;
+  if (e.code === 'Equal' || e.code === 'NumpadAdd') renderer.toneMappingExposure *= 1.1;
+  if (e.code === 'Minus' || e.code === 'NumpadSubtract') renderer.toneMappingExposure /= 1.1;
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+// VR: left stick walk, right stick forward = teleport arc, sideways = snap turn
+document.body.appendChild(VRButton.createButton(renderer, { optionalFeatures: ['local-floor'] }));
+renderer.xr.addEventListener('sessionstart', () => { ui.classList.add('hidden'); camera.position.set(0, 0, 0); });
+renderer.xr.addEventListener('sessionend', () => { camera.position.set(0, EYE, 0); ui.classList.remove('hidden'); });
+const ctrls = [0, 1].map(i => { const c = renderer.xr.getController(i); rig.add(c); return c; });
+const marker = new THREE.Mesh(new THREE.RingGeometry(0.18, 0.24, 32).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xd9b48f, toneMapped: false }));
+marker.visible = false; scene.add(marker);
+const arcGeo = new THREE.BufferGeometry().setFromPoints(new Array(30).fill(0).map(() => new THREE.Vector3()));
+const arc = new THREE.Line(arcGeo, new THREE.LineBasicMaterial({ color: 0xd9b48f, toneMapped: false }));
+arc.frustumCulled = false; arc.visible = false; scene.add(arc);
+let turnReady = true, aiming = false, target = null;
+
+function teleportArc(c) {
+  const o = new THREE.Vector3(), q = new THREE.Quaternion();
+  c.getWorldPosition(o); c.getWorldQuaternion(q);
+  const v = new THREE.Vector3(0, 0, -1).applyQuaternion(q).multiplyScalar(7);
+  const pts = arcGeo.attributes.position; let hit = null, prev = o.clone();
+  for (let i = 0; i < 30; i++) {
+    const t = i * 0.05, p = o.clone().addScaledVector(v, t); p.y -= 4.9 * t * t;
+    if (!hit && i) {
+      const d = p.clone().sub(prev); ray.set(prev, d.clone().normalize()); ray.far = d.length();
+      const h = ray.intersectObjects(colliders, false)[0];
+      if (h) { hit = h; }
+    }
+    pts.setXYZ(i, ...(hit ? hit.point : p).toArray()); prev = p;
+  }
+  pts.needsUpdate = true;
+  return hit && hit.face && hit.face.normal.clone().transformDirection(hit.object.matrixWorld).y > 0.8 ? hit.point : null;
+}
+
+function xrInput(dt) {
+  const session = renderer.xr.getSession(); if (!session) return;
+  for (const src of session.inputSources) {
+    const gp = src.gamepad; if (!gp || gp.axes.length < 4) continue;
+    const x = gp.axes[2], y = gp.axes[3];
+    if (src.handedness === 'left') {
+      if (Math.hypot(x, y) > 0.2) {
+        const dir = new THREE.Vector3(); camera.getWorldDirection(dir); dir.y = 0; dir.normalize();
+        const right = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0, 1, 0));
+        tryMove(dir.multiplyScalar(-y * 1.4 * dt).addScaledVector(right, x * 1.4 * dt));
+      }
+    } else if (src.handedness === 'right') {
+      const c = ctrls[[...session.inputSources].indexOf(src)] || ctrls[1];
+      if (y < -0.6) {
+        aiming = true; arc.visible = true; target = teleportArc(c);
+        marker.visible = !!target; if (target) marker.position.copy(target).y += 0.01;
+      } else if (aiming && Math.abs(y) < 0.3) {
+        if (target) {
+          const head = new THREE.Vector3(); camera.getWorldPosition(head);
+          rig.position.x += target.x - head.x; rig.position.z += target.z - head.z;
+        }
+        aiming = false; arc.visible = marker.visible = false; target = null;
+      }
+      if (Math.abs(x) > 0.7 && turnReady && !aiming) {
+        const head = new THREE.Vector3(); camera.getWorldPosition(head);
+        const ang = -Math.sign(x) * Math.PI / 6;
+        rig.position.sub(head).applyAxisAngle(new THREE.Vector3(0, 1, 0), ang).add(head);
+        rig.rotation.y += ang; turnReady = false;
+      }
+      if (Math.abs(x) < 0.3) turnReady = true;
+    }
+  }
+}
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (renderer.xr.isPresenting) xrInput(dt);
+  else if (controls.isLocked) {
+    const f = (keys.KeyW || keys.ArrowUp ? 1 : 0) - (keys.KeyS || keys.ArrowDown ? 1 : 0);
+    const s = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
+    if (f || s) {
+      const dir = new THREE.Vector3(); camera.getWorldDirection(dir); dir.y = 0; dir.normalize();
+      const right = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0, 1, 0));
+      const speed = (keys.ShiftLeft || keys.ShiftRight ? 2.6 : 1.4) * dt;
+      tryMove(dir.multiplyScalar(f).add(right.multiplyScalar(s)).normalize().multiplyScalar(speed));
+    }
+  }
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+status.textContent = 'Готово'; go.style.display = 'block';
+</script>
+</body>
+</html>

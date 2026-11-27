@@ -1,0 +1,17 @@
+{
+ "model": "scene.glb",
+ "env": "env.hdr",
+ "sky": "sky.hdr",
+ "skyRotation": 155.21943666236808,
+ "lightmaps": [
+  "lm0.webp"
+ ],
+ "lightmapScale": 2.8099589347839355,
+ "exposure": 3.0,
+ "reflections": 1.0,
+ "spawn": [
+  3.8890341796875,
+  5.368897481282552
+ ],
+ "spawnYaw": 0.0
+}
