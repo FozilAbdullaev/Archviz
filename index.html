@@ -26,7 +26,7 @@
   <p id="status">Загрузка…</p>
   <button id="go">Войти</button>
   <p>Мышь — осмотреться · WASD / стрелки — идти · Shift — быстрее · Esc — пауза<br>
-     В очках: кнопка «ENTER VR» внизу · левый стик — шаг · правый стик вперёд — телепорт, вбок — поворот</p>
+     В очках: кнопка «ENTER VR» внизу · левый стик — шаг · правый стик вперёд — телепорт, вбок — поворот · удерживать B или Y — выйти из VR</p>
 </div>
 <script type="importmap">
 { "imports": {
@@ -42,6 +42,7 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { Reflector } from 'three/addons/objects/Reflector.js';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
@@ -97,13 +98,48 @@ const lightmaps = await Promise.all(CFG.lightmaps.map(async f => {
 const draco = new DRACOLoader().setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/gltf/');
 const gltf = await new GLTFLoader(manager).setDRACOLoader(draco).loadAsync(CFG.model);
 const colliders = [];
-// lightmap texels carry an extra gamma 2.2 (more precision in the dark), the env map gives reflections only
+// lightmap texels carry an extra gamma 2.2 (more precision in the dark), the env map gives reflections only;
+// faces too thin to own a lightmap texel carry their light in COLOR_0 (same encoding, rgb = 0 elsewhere)
 const LM_CHUNK = THREE.ShaderChunk.lights_fragment_maps
-  .replace('lightMapTexel.rgb * lightMapIntensity', 'pow( lightMapTexel.rgb, vec3( 2.2 ) ) * lightMapIntensity')
+  .replace('lightMapTexel.rgb * lightMapIntensity',
+           'pow( vLmv.r + vLmv.g + vLmv.b > 0.0 ? vLmv : lightMapTexel.rgb, vec3( 2.2 ) ) * lightMapIntensity')
   .replace('iblIrradiance += getIBLIrradiance( geometryNormal );', '');
-const specOnly = shader => {
-  shader.fragmentShader = shader.fragmentShader.replace('#include <lights_fragment_maps>', LM_CHUNK);
-};
+// box-projected reflections: env.hdr was rendered from one point, so a plain env map reflects the room at infinity
+// (wrong place on mirrors, glass, metal, floor); intersecting the reflected ray with the room box fixes the parallax
+const EB = CFG.envBox || [[0.508, 0.0, -7.675], [6.158, 3.65, -0.625]];
+const EP = CFG.envPos || [3.333, 1.3, -4.15];
+const v3 = a => `vec3( ${a.map(x => x.toFixed(4)).join(', ')} )`;
+const BOX_FN = `
+varying vec3 vBoxPos;
+vec3 boxProject( vec3 v ) {
+  vec3 rmax = ( ${v3(EB[1])} - vBoxPos ) / v, rmin = ( ${v3(EB[0])} - vBoxPos ) / v;
+  vec3 r = max( rmax, rmin ); float t = min( min( r.x, r.y ), r.z );
+  return t > 0.0 ? vBoxPos + v * t - ${v3(EP)} : v;
+}
+`;
+const ENV_CHUNK = BOX_FN + THREE.ShaderChunk.envmap_physical_pars_fragment
+  .replace('reflectVec = inverseTransformDirection( reflectVec, viewMatrix );',
+           'reflectVec = normalize( boxProject( inverseTransformDirection( reflectVec, viewMatrix ) ) );');
+function patch(m, kind) {     // kind: 'baked' | 'glass' | 'plain'
+  m.onBeforeCompile = shader => {
+    let vs = shader.vertexShader, fs = shader.fragmentShader;
+    vs = vs.replace('#include <common>', '#include <common>\nvarying vec3 vBoxPos;')
+           .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvBoxPos = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;');
+    fs = fs.replace('#include <envmap_physical_pars_fragment>', ENV_CHUNK);
+    if (kind === 'baked') {
+      vs = vs.replace('#include <common>', '#include <common>\nattribute vec3 color;\nvarying vec3 vLmv;')
+             .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLmv = color;');
+      fs = fs.replace('#include <common>', '#include <common>\nvarying vec3 vLmv;')
+             .replace('#include <lights_fragment_maps>', LM_CHUNK);
+    }
+    if (kind === 'glass')     // reflections at full strength, only the see-through part is blended by opacity
+      fs = fs.replace('vec3 outgoingLight = totalDiffuse + totalSpecular + totalEmissiveRadiance;',
+                      'vec3 outgoingLight = totalDiffuse * diffuseColor.a + totalSpecular + totalEmissiveRadiance;');
+    shader.vertexShader = vs; shader.fragmentShader = fs;
+  };
+  m.customProgramCacheKey = () => 'p_' + kind;
+}
+const mirrors = [];
 gltf.scene.traverse(o => {
   if (!o.isMesh) return;
   const lm = o.userData.lm ?? (o.parent && o.parent.userData.lm);
@@ -111,14 +147,31 @@ gltf.scene.traverse(o => {
   for (const m of mats) {
     m.envMap = envMap;
     m.envMapIntensity = CFG.reflections;
+    const glass = /glass/i.test(m.name) && m.transparent;
     if (lm !== undefined && lm >= 0 && o.geometry.attributes.uv1) {
       m.lightMap = lightmaps[lm];
       m.lightMapIntensity = CFG.lightmapScale * Math.PI;
-      m.onBeforeCompile = specOnly;
-      m.customProgramCacheKey = () => 'speconly';
-    } else if (!m.transparent) {
-      m.emissiveMap = m.emissiveMap || m.map;     // unbaked opaque object: keep it visible
+      m.vertexColors = false;                       // COLOR_0 is light, not albedo
+      // walnut panels and the parquet: their textures are paler than the renders show
+      if (/_302$/.test(m.name)) m.color.multiply(new THREE.Color(0.58, 0.45, 0.36));
+      if (/Toned Oak/.test(m.name)) m.color.multiply(new THREE.Color(0.82, 0.68, 0.54));
+      // "stains" velvet maps read as giraffe spots at this scale; the renders show plain fabric in the same tint
+      const tint = /Vittoria_area_BARXT/.test(m.name) ? '#D6CCC1' : /Zenit 128_Microvelor/.test(m.name) ? '#9E847A'
+                 : /Zenit 9_Microvelor/.test(m.name) ? '#B29E8E' : null;
+      if (tint) { m.map = null; m.color.set(tint); }
+      patch(m, 'baked');
+    } else if (glass) {
+      m.roughness = Math.min(m.roughness, 0.04); m.metalness = 0;
+      if (/smoked/i.test(m.name)) { m.opacity = 0.8; m.color.setRGB(0.05, 0.035, 0.025); }   // dark bronze, interior faint
+      else m.opacity = Math.min(m.opacity, 0.12);
+      m.blending = THREE.CustomBlending; m.blendSrc = THREE.OneFactor; m.blendDst = THREE.OneMinusSrcAlphaFactor;
+      m.envMapIntensity = 1.3; m.depthWrite = false;
+      patch(m, 'glass');
+    } else {
+      if (!m.transparent) m.emissiveMap = m.emissiveMap || m.map;     // unbaked opaque object: keep it visible
+      patch(m, 'plain');
     }
+    if (/^Wall_Mirror/.test(m.name)) mirrors.push(o);
     if (m.map) m.map.anisotropy = 4;
   }
   o.matrixAutoUpdate = false; o.updateMatrix();
@@ -126,6 +179,24 @@ gltf.scene.traverse(o => {
 });
 scene.add(gltf.scene);
 scene.updateMatrixWorld(true);
+
+// the wall mirror: a real planar reflection on desktop; in the headset the box-projected env map (a mirror
+// camera per eye is too heavy for the Quest and Reflector does not handle the stereo camera)
+const reflectors = [];
+for (const o of mirrors) {
+  const bb = new THREE.Box3().setFromObject(o), size = bb.getSize(new THREE.Vector3()), c = bb.getCenter(new THREE.Vector3());
+  const ax = size.x < size.y && size.x < size.z ? 'x' : size.z < size.y ? 'z' : 'y';
+  const n = new THREE.Vector3(); n[ax] = Math.sign(EP[ax === 'x' ? 0 : ax === 'y' ? 1 : 2] - c[ax]) || 1;
+  const w = ax === 'x' ? size.z : size.x, h = ax === 'y' ? size.z : size.y;
+  const r = new Reflector(new THREE.PlaneGeometry(w, h), {
+    textureWidth: Math.min(2048, innerWidth * devicePixelRatio), textureHeight: Math.min(2048, innerHeight * devicePixelRatio),
+    color: 0x7d807d });
+  r.position.copy(c).addScaledVector(n, size[ax] / 2 + 0.003);
+  r.lookAt(r.position.clone().add(n));
+  scene.add(r); reflectors.push(r);
+  o.visible = false;
+}
+const mirrorMode = xr => { for (const r of reflectors) r.visible = !xr; for (const o of mirrors) o.visible = xr; };
 window.__dbg = { THREE, scene, camera, rig, renderer };
 
 // start position (glTF is Y-up: three x = blender x, three z = -blender y)
@@ -166,8 +237,8 @@ addEventListener('keyup', e => { keys[e.code] = false; });
 
 // VR: left stick walk, right stick forward = teleport arc, sideways = snap turn
 document.body.appendChild(VRButton.createButton(renderer, { optionalFeatures: ['local-floor'] }));
-renderer.xr.addEventListener('sessionstart', () => { ui.classList.add('hidden'); camera.position.set(0, 0, 0); });
-renderer.xr.addEventListener('sessionend', () => { camera.position.set(0, EYE, 0); ui.classList.remove('hidden'); });
+renderer.xr.addEventListener('sessionstart', () => { ui.classList.add('hidden'); camera.position.set(0, 0, 0); mirrorMode(true); });
+renderer.xr.addEventListener('sessionend', () => { camera.position.set(0, EYE, 0); ui.classList.remove('hidden'); mirrorMode(false); });
 const ctrls = [0, 1].map(i => { const c = renderer.xr.getController(i); rig.add(c); return c; });
 const marker = new THREE.Mesh(new THREE.RingGeometry(0.18, 0.24, 32).rotateX(-Math.PI / 2),
   new THREE.MeshBasicMaterial({ color: 0xd9b48f, toneMapped: false }));
@@ -176,6 +247,7 @@ const arcGeo = new THREE.BufferGeometry().setFromPoints(new Array(30).fill(0).ma
 const arc = new THREE.Line(arcGeo, new THREE.LineBasicMaterial({ color: 0xd9b48f, toneMapped: false }));
 arc.frustumCulled = false; arc.visible = false; scene.add(arc);
 let turnReady = true, aiming = false, target = null;
+const exitHold = {};
 
 function teleportArc(c) {
   const o = new THREE.Vector3(), q = new THREE.Quaternion();
@@ -198,7 +270,13 @@ function teleportArc(c) {
 function xrInput(dt) {
   const session = renderer.xr.getSession(); if (!session) return;
   for (const src of session.inputSources) {
-    const gp = src.gamepad; if (!gp || gp.axes.length < 4) continue;
+    const gp = src.gamepad; if (!gp) continue;
+    // B (right) or Y (left) held for half a second: leave VR
+    if (gp.buttons[5] && gp.buttons[5].pressed) {
+      exitHold[src.handedness] = (exitHold[src.handedness] || 0) + dt;
+      if (exitHold[src.handedness] > 0.5) { exitHold.left = exitHold.right = 0; session.end(); return; }
+    } else exitHold[src.handedness] = 0;
+    if (gp.axes.length < 4) continue;
     const x = gp.axes[2], y = gp.axes[3];
     if (src.handedness === 'left') {
       if (Math.hypot(x, y) > 0.2) {
