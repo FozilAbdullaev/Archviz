@@ -4,10 +4,11 @@
  "sky": "sky.hdr",
  "skyRotation": 155.21943666236808,
  "lightmaps": [
-  "lm0.webp"
+  "lm0.webp",
+  "lm1.webp"
  ],
- "lightmapScale": 6.118427276611328,
- "exposure": 2.0,
+ "lightmapScale": 4.193746566772461,
+ "exposure": 1.1,
  "reflections": 1.0,
  "envBox": [
   [
