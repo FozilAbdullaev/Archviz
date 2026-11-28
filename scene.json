@@ -2,13 +2,13 @@
  "model": "scene.glb",
  "env": "env.hdr",
  "sky": "sky.hdr",
- "skyRotation": 155.21943666236808,
+ "skyRotation": 159.32362903273705,
  "lightmaps": [
   "lm0.webp",
   "lm1.webp",
   "lm2.webp"
  ],
- "lightmapScale": 6.993831157684326,
+ "lightmapScale": 36.761070251464844,
  "exposure": 1.4,
  "reflections": 1.0,
  "envBox": [

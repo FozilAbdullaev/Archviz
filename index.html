@@ -235,7 +235,7 @@ gltf.scene.traverse(o => {
     o.material = Array.isArray(o.material) ? mats : mats[0];
   }
   for (const m of mats) {
-    if (/^Wall_Mirror/.test(m.name)) mirrors.push(o);
+    if (/^Wall_Mirror|^Mirror_Regal/.test(m.name)) mirrors.push(o);
     if (/^LED_Cove_LIGHT/.test(m.name)) o.visible = false;   // the strips sit hidden in pockets: only their light (baked) shows
     if (m.userData.done) continue;                           // tints multiply: once per material
     m.userData.done = true;
@@ -266,6 +266,8 @@ gltf.scene.traverse(o => {
         m.map = m.map.clone(); m.map.wrapS = m.map.wrapT = THREE.RepeatWrapping; m.map.repeat.set(5, 5); m.map.needsUpdate = true;
       }
       patch(m, 'baked');
+      // vanity mirror: black glossy glass (Max: IOR 2.09) over a clean mirror -> the smoked reflection of render 07
+      if (/^Glass_Regal/.test(m.name)) { m.transparent = true; m.opacity = 0.55; m.depthWrite = false; m.roughness = 0.02; }
     } else if (glass) {
       m.roughness = Math.min(m.roughness, 0.04); m.metalness = 0;
       if (/smoked/i.test(m.name)) { m.opacity = 0.7; m.color.setRGB(0.06, 0.045, 0.034); }  // dark bronze, interior faint
@@ -296,12 +298,16 @@ const reflectors = [];
 for (const o of mirrors) {
   const bb = new THREE.Box3().setFromObject(o), size = bb.getSize(new THREE.Vector3()), c = bb.getCenter(new THREE.Vector3());
   const ax = size.x < size.y && size.x < size.z ? 'x' : size.z < size.y ? 'z' : 'y';
-  const n = new THREE.Vector3(); n[ax] = Math.sign(EP[ax === 'x' ? 0 : ax === 'y' ? 1 : 2] - c[ax]) || 1;
+  // the Regal vanity mirror faces the dressing side (-x), away from the room centre; its plane goes just behind
+  // the front of the smoked glass, so the glass and its bevels stay in front of the reflection
+  const regal = /^Mirror_Regal/.test((Array.isArray(o.material) ? o.material[0] : o.material).name);
+  const n = new THREE.Vector3(); n[ax] = regal ? -1 : Math.sign(EP[ax === 'x' ? 0 : ax === 'y' ? 1 : 2] - c[ax]) || 1;
   const w = ax === 'x' ? size.z : size.x, h = ax === 'y' ? size.z : size.y;
   const r = new Reflector(new THREE.PlaneGeometry(w, h), {
     textureWidth: Math.min(2048, innerWidth * devicePixelRatio), textureHeight: Math.min(2048, innerHeight * devicePixelRatio),
     color: 0x7d807d });
-  r.position.copy(c).addScaledVector(n, size[ax] / 2 + 0.003);
+  if (regal) r.position.copy(c).setX(bb.max.x - 0.0045);
+  else r.position.copy(c).addScaledVector(n, size[ax] / 2 + 0.003);
   r.lookAt(r.position.clone().add(n));
   scene.add(r); reflectors.push(r);
   o.visible = false;
