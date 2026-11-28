@@ -54,7 +54,9 @@ THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
-const CFG = await (await fetch('scene.json')).json();   // written by the export script
+const CFG = await (await fetch('scene.json', { cache: 'no-store' })).json();   // written by the export script
+// every scene file gets ?v=<export time>: the Quest browser otherwise keeps serving the old GLB / lightmaps
+const VER = u => /^(https?:|blob:|data:)/.test(u) || !CFG.version ? u : u + (u.includes('?') ? '&' : '?') + 'v=' + CFG.version;
 const EYE = 1.6, RADIUS = 0.25;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
@@ -77,6 +79,7 @@ scene.add(rig);
 
 const bar = document.querySelector('#bar i'), status = document.getElementById('status');
 const manager = new THREE.LoadingManager();
+manager.setURLModifier(VER);
 manager.onProgress = (url, done, total) => { bar.style.width = (100 * done / total) + '%'; };
 
 // reflections: Cycles panorama from the middle of the room, used for specular only (light comes from lightmaps)
@@ -102,7 +105,7 @@ const LM_HALF = LM_Q ? LM_Q === 'half'
 async function loadLightmap(f) {
   if (!LM_HALF) return tl.loadAsync(f);
   manager.itemStart(f);
-  const blob = await (await fetch(f)).blob();
+  const blob = await (await fetch(VER(f))).blob();
   // atlases are square; a 4096 atlas passes through unchanged
   const bmp = await createImageBitmap(blob, { resizeWidth: 4096, resizeHeight: 4096, resizeQuality: 'high',
                                               colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
