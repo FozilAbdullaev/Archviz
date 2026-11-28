@@ -89,8 +89,24 @@ if (CFG.sky) {                       // sky behind the windows (same HDRI and ro
 }
 
 const tl = new THREE.TextureLoader(manager);
+// 8192 lightmaps are ~1 GB of GPU memory with mips: full size on desktop, halved on the Quest / phones
+// (or where the GPU cannot hold them); ?lm=full or ?lm=half overrides
+const LM_Q = new URLSearchParams(location.search).get('lm');
+const LM_HALF = LM_Q ? LM_Q === 'half'
+  : /OculusBrowser|Quest|Android|iPhone|iPad/i.test(navigator.userAgent) || renderer.capabilities.maxTextureSize < 8192;
+async function loadLightmap(f) {
+  if (!LM_HALF) return tl.loadAsync(f);
+  manager.itemStart(f);
+  const blob = await (await fetch(f)).blob();
+  // atlases are square; a 4096 atlas passes through unchanged
+  const bmp = await createImageBitmap(blob, { resizeWidth: 4096, resizeHeight: 4096, resizeQuality: 'high',
+                                              colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+  manager.itemEnd(f);
+  const t = new THREE.Texture(bmp); t.needsUpdate = true;
+  return t;
+}
 const lightmaps = await Promise.all(CFG.lightmaps.map(async f => {
-  const t = await tl.loadAsync(f);
+  const t = await loadLightmap(f);
   t.flipY = false; t.channel = 1; t.colorSpace = THREE.SRGBColorSpace;
   t.anisotropy = 4;
   return t;
