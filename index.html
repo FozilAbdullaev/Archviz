@@ -61,6 +61,7 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.xr.enabled = true;
 renderer.xr.setFoveation(0.5);
 document.body.appendChild(renderer.domElement);
+const MAX_ANISO = Math.min(16, renderer.capabilities.getMaxAnisotropy());
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x111111);
@@ -137,7 +138,7 @@ const ENV_CHUNK = BOX_FN + THREE.ShaderChunk.envmap_physical_pars_fragment
 // bed fabrics: the model's own velvet map at a reduced contrast (at full strength its stain pattern read as giraffe
 // spots) times a fine weave from the velvet bump map; diffuse light is baked, so the weave has to be in the albedo
 const weave = await tl.loadAsync('tex/velvet_weave.jpg');
-weave.wrapS = weave.wrapT = THREE.RepeatWrapping; weave.colorSpace = THREE.NoColorSpace; weave.anisotropy = 4;
+weave.wrapS = weave.wrapT = THREE.RepeatWrapping; weave.colorSpace = THREE.NoColorSpace; weave.anisotropy = MAX_ANISO;
 function imgAvg(img, srgb) {
   const c = new OffscreenCanvas(32, 32), g = c.getContext('2d'); g.drawImage(img, 0, 0, 32, 32);
   const d = g.getImageData(0, 0, 32, 32).data, s = [0, 0, 0];
@@ -258,7 +259,9 @@ gltf.scene.traverse(o => {
       if (/ficus_banjamina trunk|Graund/.test(m.name)) m.envMapIntensity = 0.55;
       patch(m, 'plain');
     }
-    if (m.map) m.map.anisotropy = 4;
+    // full anisotropic filtering: the floor, rug and wall panels are seen at grazing angles and blurred at 4x
+    for (const k of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'bumpMap', 'aoMap', 'emissiveMap'])
+      if (m[k]) m[k].anisotropy = MAX_ANISO;
   }
   o.matrixAutoUpdate = false; o.updateMatrix();
   if (lm !== undefined && lm >= 0) { o.geometry.computeBoundsTree(); colliders.push(o); }
@@ -321,7 +324,7 @@ addEventListener('keydown', e => { keys[e.code] = true;
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
 
-// VR: left stick walk, right stick forward = teleport arc, sideways = snap turn
+// VR: left stick walk, right stick forward = teleport arc, sideways = smooth turn
 document.body.appendChild(VRButton.createButton(renderer, { optionalFeatures: ['local-floor'] }));
 renderer.xr.addEventListener('sessionstart', () => { ui.classList.add('hidden'); camera.position.set(0, 0, 0); mirrorMode(true); });
 renderer.xr.addEventListener('sessionend', () => { camera.position.set(0, EYE, 0); ui.classList.remove('hidden'); mirrorMode(false); });
@@ -332,7 +335,8 @@ marker.visible = false; scene.add(marker);
 const arcGeo = new THREE.BufferGeometry().setFromPoints(new Array(30).fill(0).map(() => new THREE.Vector3()));
 const arc = new THREE.Line(arcGeo, new THREE.LineBasicMaterial({ color: 0xd9b48f, toneMapped: false }));
 arc.frustumCulled = false; arc.visible = false; scene.add(arc);
-let turnReady = true, aiming = false, target = null;
+let turnRate = 0, aiming = false, target = null;
+const TURN_SPEED = THREE.MathUtils.degToRad(100);   // rad/s at full stick
 const exitHold = {};
 
 function teleportArc(c) {
@@ -382,13 +386,15 @@ function xrInput(dt) {
         }
         aiming = false; arc.visible = marker.visible = false; target = null;
       }
-      if (Math.abs(x) > 0.7 && turnReady && !aiming) {
+      // smooth turn: speed follows how far the stick is pushed (dead zone, soft curve, eased start and stop)
+      const ax = Math.abs(x), want = aiming || ax < 0.15 ? 0 : -Math.sign(x) * Math.pow((ax - 0.15) / 0.85, 1.6) * TURN_SPEED;
+      turnRate += (want - turnRate) * Math.min(1, dt * 10);
+      if (Math.abs(turnRate) > 1e-4) {
         const head = new THREE.Vector3(); camera.getWorldPosition(head);
-        const ang = -Math.sign(x) * Math.PI / 6;
+        const ang = turnRate * dt;
         rig.position.sub(head).applyAxisAngle(new THREE.Vector3(0, 1, 0), ang).add(head);
-        rig.rotation.y += ang; turnReady = false;
+        rig.rotation.y += ang;
       }
-      if (Math.abs(x) < 0.3) turnReady = true;
     }
   }
 }
