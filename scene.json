@@ -5,10 +5,11 @@
  "skyRotation": 155.21943666236808,
  "lightmaps": [
   "lm0.webp",
-  "lm1.webp"
+  "lm1.webp",
+  "lm2.webp"
  ],
- "lightmapScale": 4.193746566772461,
- "exposure": 1.1,
+ "lightmapScale": 6.508243560791016,
+ "exposure": 1.4,
  "reflections": 1.0,
  "envBox": [
   [
