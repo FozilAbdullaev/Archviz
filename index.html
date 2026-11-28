@@ -17,6 +17,9 @@
   #go { padding: 12px 28px; font-size: 16px; border: 0; border-radius: 6px; background: #d9b48f; color: #222;
         cursor: pointer; display: none; }
   #VRButton { z-index: 3; }
+  #cast { font-size: 14px; color: #d9b48f; user-select: text; }
+  #badge { position: fixed; left: 12px; top: 10px; z-index: 3; color: #eee; font-size: 13px; background: rgba(0, 0, 0, .45);
+           padding: 4px 10px; border-radius: 4px; display: none; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -25,9 +28,11 @@
   <div id="bar"><i></i></div>
   <p id="status">Загрузка…</p>
   <button id="go">Войти</button>
-  <p>Мышь — осмотреться · WASD / стрелки — идти · Shift — быстрее · Esc — пауза<br>
+  <p id="cast"></p>
+  <p id="help">Мышь — осмотреться · WASD / стрелки — идти · Shift — быстрее · Esc — пауза<br>
      В очках: кнопка «ENTER VR» внизу · левый стик — шаг · правый стик вперёд — телепорт, вбок — поворот · удерживать B или Y — выйти из VR</p>
 </div>
+<div id="badge"></div>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
@@ -341,7 +346,8 @@ addEventListener('keydown', e => { keys[e.code] = true;
 addEventListener('keyup', e => { keys[e.code] = false; });
 
 // VR: left stick walk, right stick forward = teleport arc, sideways = smooth turn
-document.body.appendChild(VRButton.createButton(renderer, { optionalFeatures: ['local-floor'] }));
+const WATCH = new URLSearchParams(location.search).get('watch');   // ?watch=CODE: this PC shows the headset's view
+if (!WATCH) document.body.appendChild(VRButton.createButton(renderer, { optionalFeatures: ['local-floor'] }));
 renderer.xr.addEventListener('sessionstart', () => { ui.classList.add('hidden'); camera.position.set(0, 0, 0); mirrorMode(true); });
 renderer.xr.addEventListener('sessionend', () => { camera.position.set(0, EYE, 0); ui.classList.remove('hidden'); mirrorMode(false); });
 const ctrls = [0, 1].map(i => { const c = renderer.xr.getController(i); rig.add(c); return c; });
@@ -418,7 +424,8 @@ function xrInput(dt) {
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
-  if (renderer.xr.isPresenting) xrInput(dt);
+  if (WATCH) watchStep(dt);
+  else if (renderer.xr.isPresenting) xrInput(dt);
   else if (controls.isLocked) {
     const f = (keys.KeyW || keys.ArrowUp ? 1 : 0) - (keys.KeyS || keys.ArrowDown ? 1 : 0);
     const s = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
@@ -430,13 +437,97 @@ renderer.setAnimationLoop(() => {
     }
   }
   renderer.render(scene, camera);
+  if (!WATCH) castPose();               // after render: in VR the renderer has just put the head pose into camera.matrixWorld
 });
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 });
-status.textContent = 'Готово'; go.style.display = 'block';
+// ---------- spectator: the PC shows what the headset sees ----------
+// Only the head pose travels (WebRTC data channel via PeerJS, ~30 Hz); the PC renders the same scene itself.
+// Headset: registers as archviz-bedroom-<code> and shows the watch link on its start page.
+// PC: ?watch=<code> connects, follows the pose smoothly, reconnects when the headset reloads.
+const PEER_PREFIX = 'archviz-bedroom-';
+const loadPeer = () => import('https://cdn.jsdelivr.net/npm/peerjs@1.5.4/+esm').then(m => m.Peer || m.default);
+const castEl = document.getElementById('cast'), badge = document.getElementById('badge');
+const viewers = new Set(); let lastSend = 0;
+const cP = new THREE.Vector3(), cQ = new THREE.Quaternion(), cS = new THREE.Vector3();
+function castPose() {
+  if (!viewers.size) return;
+  const t = performance.now(); if (t - lastSend < 33) return; lastSend = t;
+  camera.matrixWorld.decompose(cP, cQ, cS);
+  const msg = [cP.x, cP.y, cP.z, cQ.x, cQ.y, cQ.z, cQ.w].map(v => Math.round(v * 1e4) / 1e4);
+  for (const c of viewers) if (c.open) try { c.send(msg); } catch (e) { viewers.delete(c); }
+}
+function startCast(Peer, tries = 0) {
+  let code = localStorage.getItem('archvizCastCode');
+  if (!code || tries > 2) { code = String(1000 + Math.floor(Math.random() * 9000)); localStorage.setItem('archvizCastCode', code); }
+  const link = location.origin + location.pathname + '?watch=' + code;
+  const show = () => castEl.innerHTML = `Смотреть с компьютера: <b>${link}</b><br>код ${code}` +
+    (viewers.size ? ` · подключено зрителей: ${viewers.size}` : '');
+  const peer = new Peer(PEER_PREFIX + code);
+  peer.on('open', show);
+  peer.on('connection', c => {
+    c.on('open', () => { viewers.add(c); show(); });
+    const drop = () => { viewers.delete(c); show(); };
+    c.on('close', drop); c.on('error', drop);
+  });
+  peer.on('disconnected', () => { if (!peer.destroyed) setTimeout(() => !peer.destroyed && peer.reconnect(), 2000); });
+  peer.on('error', e => {      // id still held by a previous tab of this headset: retry, then take a new code
+    if (e.type === 'peer-unavailable') return;
+    peer.destroy(); setTimeout(() => startCast(Peer, e.type === 'unavailable-id' ? tries + 1 : 0), e.type === 'unavailable-id' ? 2500 : 6000);
+  });
+}
+
+const wP = new THREE.Vector3(), wQ = new THREE.Quaternion();
+let gotPose = false, lastPose = 0, watchConn = null;
+function watchStep(dt) {
+  if (!gotPose) return;
+  const a = 1 - Math.exp(-dt * 14);    // smooths the 30 Hz pose stream to the monitor's frame rate
+  camera.position.lerp(wP, a); camera.quaternion.slerp(wQ, a);
+  const lost = performance.now() - lastPose > 3000;
+  badge.textContent = lost ? `Вид из очков · код ${WATCH} · нет сигнала, жду…` : `Вид из очков · код ${WATCH} · F — во весь экран`;
+  if (performance.now() - lastPose > 8000 && watchConn) { watchConn.close(); watchConn = null; }
+}
+function startWatch(Peer) {
+  scene.add(camera);                   // off the rig: the pose arrives in world space
+  camera.position.set(rig.position.x, EYE, rig.position.z);
+  let retryT = 0;
+  const peer = new Peer();
+  const retry = () => { clearTimeout(retryT); retryT = setTimeout(connect, 3000); };
+  function connect() {
+    if (peer.disconnected) { peer.reconnect(); return; }
+    const c = peer.connect(PEER_PREFIX + WATCH, { serialization: 'json' }); watchConn = c;
+    c.on('open', () => { status.textContent = 'Подключено, жду картинку с очков…'; });
+    c.on('data', d => {
+      if (!Array.isArray(d) || d.length < 7) return;
+      wP.set(d[0], d[1], d[2]); wQ.set(d[3], d[4], d[5], d[6]).normalize();
+      if (!gotPose) { camera.position.copy(wP); camera.quaternion.copy(wQ); ui.classList.add('hidden'); badge.style.display = 'block'; }
+      gotPose = true; lastPose = performance.now();
+    });
+    c.on('close', () => { if (watchConn === c) watchConn = null; retry(); });
+    c.on('error', retry);
+  }
+  peer.on('open', connect);
+  peer.on('disconnected', () => setTimeout(() => !peer.destroyed && peer.reconnect(), 2000));
+  peer.on('error', e => {
+    if (e.type === 'peer-unavailable' && !gotPose) status.textContent = `Очки с кодом ${WATCH} пока не в сети: откройте сайт в очках. Повторяю…`;
+    retry();
+  });
+  addEventListener('keydown', e => { if (e.code === 'KeyF') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen(); });
+}
+
+if (WATCH) {
+  document.querySelector('#ui h1').textContent = 'Вид из очков';
+  document.getElementById('help').style.display = 'none';
+  status.textContent = `Подключаюсь к очкам (код ${WATCH})…`;
+  loadPeer().then(startWatch).catch(() => status.textContent = 'Не удалось загрузить модуль трансляции (PeerJS). Проверьте интернет.');
+} else {
+  status.textContent = 'Готово'; go.style.display = 'block';
+  loadPeer().then(p => startCast(p)).catch(() => {});
+}
+window.__dbg.viewers = viewers;
 </script>
 </body>
 </html>
